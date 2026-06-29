@@ -1,7 +1,7 @@
 #!/usr/bin/env -S uv run --script
 # /// script
 # requires-python = ">=3.10"
-# dependencies = ["google-genai>=1.0.0"]
+# dependencies = ["google-genai>=1.0.0", "pillow>=10.0.0"]
 # ///
 """nano-banana — generate or edit images with Google's "Nano Banana".
 
@@ -16,6 +16,13 @@ Examples:
   nano-banana "make the sky purple" -i photo.png -o edited.png
   nano-banana "alpine cabin logo" -a 16:9 -n 3 --seed 42 -o logo.png
   nano-banana "compose these" -i a.png -i b.png -a 1:1 -o combined.png
+  nano-banana "wide hero banner" --size 1180x400 -o hero.png
+
+Note on --size: Gemini image models never emit arbitrary pixel dimensions —
+they render at a resolution tier x a fixed aspect ratio. --size emulates an
+exact W x H by generating at the closest supported aspect ratio (and, on models
+that support it, the smallest resolution tier big enough to avoid upscaling),
+then center-cropping and resizing to exactly W x H locally via Pillow.
 """
 
 from __future__ import annotations
@@ -30,7 +37,11 @@ from pathlib import Path
 ASPECT_RATIOS = [
     "1:1", "2:3", "3:2", "3:4", "4:3", "4:5", "5:4", "9:16", "16:9", "21:9",
 ]
+# gemini-3.1-flash-image adds these very-wide / very-tall ratios.
+EXTRA_RATIOS = ["1:4", "4:1", "1:8", "8:1"]
 IMAGE_SIZES = ["1K", "2K", "4K"]  # model-dependent (e.g. gemini-3-pro-image)
+# Approx longer-side pixels per tier, used to pick a tier that avoids upscaling.
+TIER_LONG_SIDE = {"1K": 1024, "2K": 2048, "4K": 4096}
 SAFETY_CATEGORIES = {
     "harassment": "HARM_CATEGORY_HARASSMENT",
     "hate": "HARM_CATEGORY_HATE_SPEECH",
@@ -42,6 +53,75 @@ SAFETY_THRESHOLDS = [
     "BLOCK_NONE", "BLOCK_ONLY_HIGH", "BLOCK_MEDIUM_AND_ABOVE",
     "BLOCK_LOW_AND_ABOVE", "OFF",
 ]
+
+
+def parse_size(spec: str) -> tuple[int, int]:
+    """Parse a 'WxH' string (e.g. '1180x400') into (width, height)."""
+    cleaned = spec.lower().replace("px", "").replace("×", "x").strip()
+    if "x" not in cleaned:
+        sys.exit(f"error: --size must be WxH (e.g. 1180x400), got {spec!r}")
+    w_str, h_str = cleaned.split("x", 1)
+    try:
+        w, h = int(w_str), int(h_str)
+    except ValueError:
+        sys.exit(f"error: --size must be integers WxH, got {spec!r}")
+    if w <= 0 or h <= 0:
+        sys.exit(f"error: --size dimensions must be positive, got {spec!r}")
+    return w, h
+
+
+def supported_ratios(model: str) -> list[str]:
+    """Aspect ratios the given model accepts."""
+    return ASPECT_RATIOS + EXTRA_RATIOS if "3.1" in model else ASPECT_RATIOS
+
+
+def model_supports_image_size(model: str) -> bool:
+    """Whether the model honors the image_size (1K/2K/4K) tier."""
+    return "gemini-3" in model
+
+
+def closest_ratio(width: int, height: int, ratios: list[str]) -> str:
+    """Pick the supported 'W:H' ratio nearest the target, in log space."""
+    import math
+    target = math.log(width / height)
+    return min(
+        ratios,
+        key=lambda r: abs(math.log(int(r.split(":")[0]) / int(r.split(":")[1])) - target),
+    )
+
+
+def tier_for(long_side: int) -> str:
+    """Smallest tier whose longer side is >= the target longer side."""
+    for tier in IMAGE_SIZES:
+        if TIER_LONG_SIDE[tier] >= long_side:
+            return tier
+    return IMAGE_SIZES[-1]
+
+
+def crop_resize(data: bytes, width: int, height: int) -> tuple[bytes, bool]:
+    """Center-crop to the target ratio then resize to exactly width x height.
+
+    Returns (png_bytes, upscaled) where upscaled flags a quality-lossy enlarge.
+    """
+    import io
+    from PIL import Image
+
+    im = Image.open(io.BytesIO(data)).convert("RGB")
+    src_w, src_h = im.size
+    upscaled = src_w < width or src_h < height
+    target_ratio = width / height
+    if src_w / src_h > target_ratio:  # too wide — trim sides
+        new_w = round(src_h * target_ratio)
+        left = (src_w - new_w) // 2
+        im = im.crop((left, 0, left + new_w, src_h))
+    else:  # too tall — trim top/bottom
+        new_h = round(src_w / target_ratio)
+        top = (src_h - new_h) // 2
+        im = im.crop((0, top, src_w, top + new_h))
+    im = im.resize((width, height), Image.LANCZOS)
+    buf = io.BytesIO()
+    im.save(buf, format="PNG")
+    return buf.getvalue(), upscaled
 
 
 def build_parser() -> argparse.ArgumentParser:
@@ -64,6 +144,10 @@ def build_parser() -> argparse.ArgumentParser:
                    help="model id (default: gemini-2.5-flash-image)")
 
     # image config
+    p.add_argument("--size", metavar="WxH",
+                   help="exact output pixels, e.g. 1180x400. Generates at the closest "
+                        "aspect ratio + a tier big enough to avoid upscaling, then "
+                        "center-crops/resizes locally. Overrides -a unless -a is given.")
     p.add_argument("-a", "--aspect-ratio", choices=ASPECT_RATIOS, metavar="RATIO",
                    help="output aspect ratio (e.g. 16:9)")
     p.add_argument("-s", "--image-size", choices=IMAGE_SIZES, metavar="SIZE",
@@ -116,6 +200,18 @@ def main() -> int:
 
     prompt = " ".join(args.prompt)
 
+    # --size: derive aspect ratio (and tier) to generate, crop to exact px after.
+    target_size = None
+    aspect_ratio = args.aspect_ratio
+    image_size = args.image_size
+    if args.size:
+        target_size = parse_size(args.size)
+        tw, th = target_size
+        if aspect_ratio is None:
+            aspect_ratio = closest_ratio(tw, th, supported_ratios(args.model))
+        if image_size is None and model_supports_image_size(args.model):
+            image_size = tier_for(max(tw, th))
+
     # Build contents: prompt text + any input images as Parts.
     contents = [prompt]
     for img in args.image:
@@ -126,12 +222,12 @@ def main() -> int:
         contents.append(types.Part.from_bytes(data=path.read_bytes(), mime_type=mime))
 
     image_config = None
-    if args.aspect_ratio or args.image_size:
+    if aspect_ratio or image_size:
         kw = {}
-        if args.aspect_ratio:
-            kw["aspect_ratio"] = args.aspect_ratio
-        if args.image_size:
-            kw["image_size"] = args.image_size
+        if aspect_ratio:
+            kw["aspect_ratio"] = aspect_ratio
+        if image_size:
+            kw["image_size"] = image_size
         image_config = types.ImageConfig(**kw)
 
     cfg_kwargs = {
@@ -160,7 +256,11 @@ def main() -> int:
     config = types.GenerateContentConfig(**cfg_kwargs)
 
     client = genai.Client(api_key=api_key)
-    print(f"generating with {args.model}...", file=sys.stderr)
+    detail = f" @ {aspect_ratio}" if aspect_ratio else ""
+    detail += f" {image_size}" if image_size else ""
+    if target_size:
+        detail += f" -> crop to {target_size[0]}x{target_size[1]}"
+    print(f"generating with {args.model}{detail}...", file=sys.stderr)
     try:
         response = client.models.generate_content(
             model=args.model, contents=contents, config=config,
@@ -192,8 +292,14 @@ def main() -> int:
 
     for idx, data in enumerate(images):
         target = out if idx == 0 else f"{base}-{idx + 1}{ext}"
+        note = ""
+        if target_size:
+            data, upscaled = crop_resize(data, *target_size)
+            note = f" [{target_size[0]}x{target_size[1]}]"
+            if upscaled:
+                note += " (upscaled — source smaller than target)"
         Path(target).write_bytes(data)
-        print(f"ok -> {target} ({len(data)} bytes)")
+        print(f"ok -> {target} ({len(data)} bytes){note}")
 
     if args.json:
         usage = getattr(response, "usage_metadata", None)

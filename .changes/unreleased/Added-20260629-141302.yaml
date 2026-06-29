@@ -1,0 +1,3 @@
+kind: Added
+body: '--size WxH flag: generate at the closest aspect ratio (and tier) then center-crop/resize locally to exact pixel dimensions'
+time: 2026-06-29T14:13:02.099126-06:00
