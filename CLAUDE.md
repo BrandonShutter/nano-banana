@@ -52,3 +52,24 @@ Auth comes from `GEMINI_API_KEY` (or `GOOGLE_API_KEY`) in the environment, or
   stdout stays limited to `ok -> <path>` lines.
 - Keep `README.md`'s flag table and the argparse definition in sync when adding
   or changing flags.
+
+## Changelog (changie)
+
+Changelog entries are managed with [changie](https://changie.dev) — config in
+`.changie.yaml`, unreleased entries in `.changes/unreleased/`, released versions
+aggregated into `CHANGELOG.md` (Keep a Changelog format, semver).
+
+- **Add an entry per user-facing change** (do this alongside the code change):
+  ```sh
+  changie new -k Added -b "what changed"   # non-interactive
+  changie new                              # interactive prompt
+  ```
+- Kinds map to semver auto-bumps: `Added`/`Deprecated` → minor,
+  `Changed`/`Removed` → major, `Fixed`/`Security` → patch.
+- **Cut a release** (do not do this for routine changes — only when releasing):
+  ```sh
+  changie batch auto   # or: changie batch <version>
+  changie merge        # writes CHANGELOG.md
+  ```
+- `changie batch auto --dry-run` previews the next version and rendered section
+  without consuming the unreleased entries.

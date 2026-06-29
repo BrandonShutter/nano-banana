@@ -106,3 +106,19 @@ The file is both the executable and its own dependency manifest:
 
 `uv` reads that header, resolves `google-genai` into a cached env, and runs the
 script. First invocation installs; subsequent runs are instant.
+
+## Changelog
+
+Changes are tracked with [changie](https://changie.dev). Add an entry for any
+user-facing change:
+
+```sh
+changie new            # pick a kind, write a one-line description
+```
+
+This drops a file in `.changes/unreleased/`. At release time, aggregate them
+into `CHANGELOG.md`:
+
+```sh
+changie batch auto && changie merge
+```
