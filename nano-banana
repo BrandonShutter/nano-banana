@@ -1,0 +1,207 @@
+#!/usr/bin/env -S uv run --script
+# /// script
+# requires-python = ">=3.10"
+# dependencies = ["google-genai>=1.0.0"]
+# ///
+"""nano-banana — generate or edit images with Google's "Nano Banana".
+
+Thin CLI over the official Google Gen AI SDK (google-genai). Exposes the full
+generateContent image surface so anyone can drive it from any directory.
+
+Auth: reads GEMINI_API_KEY (or GOOGLE_API_KEY) from the environment
+(set in ~/.zshenv). Run with `uv` installed — deps are auto-fetched.
+
+Examples:
+  nano-banana "a ripe banana on a white background"
+  nano-banana "make the sky purple" -i photo.png -o edited.png
+  nano-banana "alpine cabin logo" -a 16:9 -n 3 --seed 42 -o logo.png
+  nano-banana "compose these" -i a.png -i b.png -a 1:1 -o combined.png
+"""
+
+from __future__ import annotations
+
+import argparse
+import os
+import sys
+import time
+import mimetypes
+from pathlib import Path
+
+ASPECT_RATIOS = [
+    "1:1", "2:3", "3:2", "3:4", "4:3", "4:5", "5:4", "9:16", "16:9", "21:9",
+]
+IMAGE_SIZES = ["1K", "2K", "4K"]  # model-dependent (e.g. gemini-3-pro-image)
+SAFETY_CATEGORIES = {
+    "harassment": "HARM_CATEGORY_HARASSMENT",
+    "hate": "HARM_CATEGORY_HATE_SPEECH",
+    "sexual": "HARM_CATEGORY_SEXUALLY_EXPLICIT",
+    "dangerous": "HARM_CATEGORY_DANGEROUS_CONTENT",
+    "civic": "HARM_CATEGORY_CIVIC_INTEGRITY",
+}
+SAFETY_THRESHOLDS = [
+    "BLOCK_NONE", "BLOCK_ONLY_HIGH", "BLOCK_MEDIUM_AND_ABOVE",
+    "BLOCK_LOW_AND_ABOVE", "OFF",
+]
+
+
+def build_parser() -> argparse.ArgumentParser:
+    p = argparse.ArgumentParser(
+        prog="nano-banana",
+        description="Generate or edit images with Gemini (Nano Banana) image models.",
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+        epilog=(
+            "aspect ratios: " + ", ".join(ASPECT_RATIOS) + "\n"
+            "image sizes:   " + ", ".join(IMAGE_SIZES) + " (only some models, e.g. gemini-3-pro-image)\n"
+            "safety cats:   " + ", ".join(SAFETY_CATEGORIES) + "\n"
+            "safety levels: " + ", ".join(SAFETY_THRESHOLDS)
+        ),
+    )
+    p.add_argument("prompt", nargs="+", help="text prompt (quote it)")
+    p.add_argument("-o", "--out", help="output PNG path (default: nano-banana-<epoch>.png)")
+    p.add_argument("-i", "--image", action="append", default=[], metavar="FILE",
+                   help="input image to edit/condition on (repeatable)")
+    p.add_argument("-m", "--model", default="gemini-2.5-flash-image",
+                   help="model id (default: gemini-2.5-flash-image)")
+
+    # image config
+    p.add_argument("-a", "--aspect-ratio", choices=ASPECT_RATIOS, metavar="RATIO",
+                   help="output aspect ratio (e.g. 16:9)")
+    p.add_argument("-s", "--image-size", choices=IMAGE_SIZES, metavar="SIZE",
+                   help="output resolution 1K|2K|4K (model-dependent)")
+
+    # generation config
+    p.add_argument("-n", "--count", type=int, metavar="N",
+                   help="candidateCount: number of images to generate")
+    p.add_argument("--temperature", type=float, help="sampling temperature")
+    p.add_argument("--top-p", type=float, help="nucleus sampling top_p")
+    p.add_argument("--top-k", type=int, help="top_k sampling")
+    p.add_argument("--seed", type=int, help="deterministic seed")
+    p.add_argument("--max-output-tokens", type=int, help="cap output tokens")
+    p.add_argument("--system", metavar="TEXT", help="system instruction")
+    p.add_argument("--modalities", default="IMAGE", metavar="LIST",
+                   help="response modalities, comma list (default: IMAGE; e.g. IMAGE,TEXT)")
+    p.add_argument("--safety", action="append", default=[], metavar="CAT:LEVEL",
+                   help="safety setting, repeatable (e.g. dangerous:BLOCK_NONE)")
+
+    p.add_argument("--api-key", default=None,
+                   help="override API key (else GEMINI_API_KEY / GOOGLE_API_KEY)")
+    p.add_argument("--json", action="store_true",
+                   help="also print usage/finish metadata to stderr")
+    return p
+
+
+def parse_safety(specs, types):
+    settings = []
+    for spec in specs:
+        if ":" not in spec:
+            sys.exit(f"error: --safety must be CAT:LEVEL, got {spec!r}")
+        cat, level = spec.split(":", 1)
+        category = SAFETY_CATEGORIES.get(cat.lower(), cat)
+        settings.append(types.SafetySetting(category=category, threshold=level))
+    return settings
+
+
+def main() -> int:
+    args = build_parser().parse_args()
+
+    api_key = args.api_key or os.environ.get("GEMINI_API_KEY") or os.environ.get("GOOGLE_API_KEY")
+    if not api_key:
+        sys.exit("error: set GEMINI_API_KEY (or GOOGLE_API_KEY) in ~/.zshenv, or pass --api-key")
+
+    try:
+        from google import genai
+        from google.genai import types
+    except ImportError:
+        sys.exit("error: google-genai not available (run via `uv run` / install google-genai)")
+
+    prompt = " ".join(args.prompt)
+
+    # Build contents: prompt text + any input images as Parts.
+    contents = [prompt]
+    for img in args.image:
+        path = Path(img)
+        if not path.is_file():
+            sys.exit(f"error: input image not found: {img}")
+        mime = mimetypes.guess_type(path.name)[0] or "image/png"
+        contents.append(types.Part.from_bytes(data=path.read_bytes(), mime_type=mime))
+
+    image_config = None
+    if args.aspect_ratio or args.image_size:
+        kw = {}
+        if args.aspect_ratio:
+            kw["aspect_ratio"] = args.aspect_ratio
+        if args.image_size:
+            kw["image_size"] = args.image_size
+        image_config = types.ImageConfig(**kw)
+
+    cfg_kwargs = {
+        "response_modalities": [m.strip().upper() for m in args.modalities.split(",") if m.strip()],
+    }
+    if image_config is not None:
+        cfg_kwargs["image_config"] = image_config
+    if args.count is not None:
+        cfg_kwargs["candidate_count"] = args.count
+    if args.temperature is not None:
+        cfg_kwargs["temperature"] = args.temperature
+    if args.top_p is not None:
+        cfg_kwargs["top_p"] = args.top_p
+    if args.top_k is not None:
+        cfg_kwargs["top_k"] = args.top_k
+    if args.seed is not None:
+        cfg_kwargs["seed"] = args.seed
+    if args.max_output_tokens is not None:
+        cfg_kwargs["max_output_tokens"] = args.max_output_tokens
+    if args.system:
+        cfg_kwargs["system_instruction"] = args.system
+    safety = parse_safety(args.safety, types)
+    if safety:
+        cfg_kwargs["safety_settings"] = safety
+
+    config = types.GenerateContentConfig(**cfg_kwargs)
+
+    client = genai.Client(api_key=api_key)
+    print(f"generating with {args.model}...", file=sys.stderr)
+    try:
+        response = client.models.generate_content(
+            model=args.model, contents=contents, config=config,
+        )
+    except Exception as exc:  # surface API errors cleanly
+        sys.exit(f"error: {exc}")
+
+    out = args.out or f"nano-banana-{int(time.time())}.png"
+    base, ext = os.path.splitext(out)
+    ext = ext or ".png"
+
+    images: list[bytes] = []
+    texts: list[str] = []
+    for cand in (response.candidates or []):
+        content = getattr(cand, "content", None)
+        for part in (getattr(content, "parts", None) or []):
+            inline = getattr(part, "inline_data", None)
+            if inline and getattr(inline, "data", None):
+                images.append(inline.data)
+            elif getattr(part, "text", None):
+                texts.append(part.text)
+
+    if texts:
+        print("\n".join(texts), file=sys.stderr)
+
+    if not images:
+        feedback = getattr(response, "prompt_feedback", None)
+        sys.exit(f"FAILED: no image returned. {feedback or ''}".strip())
+
+    for idx, data in enumerate(images):
+        target = out if idx == 0 else f"{base}-{idx + 1}{ext}"
+        Path(target).write_bytes(data)
+        print(f"ok -> {target} ({len(data)} bytes)")
+
+    if args.json:
+        usage = getattr(response, "usage_metadata", None)
+        if usage:
+            print(f"usage: {usage}", file=sys.stderr)
+
+    return 0
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())
