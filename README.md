@@ -15,18 +15,25 @@ environment on first run.
 - [`uv`](https://docs.astral.sh/uv/) on your `PATH` (the script's shebang is
   `#!/usr/bin/env -S uv run --script`).
 - A Gemini API key in the environment as `GEMINI_API_KEY` (or `GOOGLE_API_KEY`).
-  It's already exported from `~/.zshenv`. Get one at
+  It's stored in the macOS keychain as `gemini-api-key` and injected by the
+  wrapper below, so it isn't exported to every process. Get one at
   [Google AI Studio](https://aistudio.google.com/apikey).
 
 ## Install / aliases
 
 The script lives at `/Volumes/Developer/code/shared/nano-banana/nano-banana`
-and is aliased in `~/.aliases`:
+and is wrapped in `~/.aliases`:
 
 ```sh
-alias nano-banana="/Volumes/Developer/code/shared/nano-banana/nano-banana"
+nano-banana() {
+  GEMINI_API_KEY="$(security find-generic-password -s gemini-api-key -w)" \
+    /Volumes/Developer/code/shared/nano-banana/nano-banana "$@"
+}
 alias banana="nano-banana"
 ```
+
+To store or replace the key:
+`security add-generic-password -U -a "$USER" -s gemini-api-key -w`
 
 Reload your shell (`source ~/.aliases`) and it's available everywhere.
 

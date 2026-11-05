@@ -9,7 +9,8 @@ Thin CLI over the official Google Gen AI SDK (google-genai). Exposes the full
 generateContent image surface so anyone can drive it from any directory.
 
 Auth: reads GEMINI_API_KEY (or GOOGLE_API_KEY) from the environment
-(set in ~/.zshenv). Run with `uv` installed — deps are auto-fetched.
+(the ~/.aliases wrapper injects it from the macOS keychain item
+`gemini-api-key`). Run with `uv` installed — deps are auto-fetched.
 
 Examples:
   nano-banana "a ripe banana on a white background"
@@ -190,7 +191,8 @@ def main() -> int:
 
     api_key = args.api_key or os.environ.get("GEMINI_API_KEY") or os.environ.get("GOOGLE_API_KEY")
     if not api_key:
-        sys.exit("error: set GEMINI_API_KEY (or GOOGLE_API_KEY) in ~/.zshenv, or pass --api-key")
+        sys.exit("error: GEMINI_API_KEY (or GOOGLE_API_KEY) is not set. Run via the ~/.aliases "
+                 "wrapper, which reads keychain item gemini-api-key, or pass --api-key")
 
     try:
         from google import genai
